@@ -1,0 +1,17 @@
+{
+  "name": "tally-bridge-service",
+  "version": "1.0.0",
+  "description": "HTTP bridge between OpenClaw Instance A (extractor) and Instance B (Tally poster)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  }
+}

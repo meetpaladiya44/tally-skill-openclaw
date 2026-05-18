@@ -1,0 +1,18 @@
+# Dependencies
+bridge-service/node_modules/
+
+# Secrets - NEVER commit
+.env
+.env*
+bridge-service/.env
+*.env.local
+
+# Idempotency cache
+bridge-service/data/
+
+.cursor/
+dev-testing.md
+
+# OS files
+.DS_Store
+Thumbs.db
