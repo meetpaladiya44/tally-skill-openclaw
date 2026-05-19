@@ -135,12 +135,14 @@ app.post('/v1/extract', verifyBearer, upload.single('file'), async (req, res) =>
       });
     }
 
+    console.log(`extract start request_id=${requestId} file=${req.file.originalname}`);
     const imagePaths = await prepareImagePaths(req.file, workDir);
     const result = await runCodex({
       imagePaths,
       prompt,
       schemaHint,
       requestId,
+      workDir,
     });
 
     const response = {
@@ -156,6 +158,7 @@ app.post('/v1/extract', verifyBearer, upload.single('file'), async (req, res) =>
       saveCacheEntry(idemKey, response);
     }
 
+    console.log(`extract done request_id=${requestId} pages=${result.pages}`);
     return res.status(200).json(response);
   } catch (err) {
     console.error('extract error:', err.message);

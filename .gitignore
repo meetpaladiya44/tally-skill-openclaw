@@ -1,11 +1,12 @@
 # Dependencies
 extractor-service/node_modules/
 
-# Secrets - NEVER commit
+# Secrets - NEVER commit real .env (but DO commit .env.example)
 .env
-.env*
+.env.local
+.env.*.local
 extractor-service/.env
-*.env.local
+!extractor-service/.env.example
 
 # Cache / uploads
 extractor-service/data/

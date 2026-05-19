@@ -122,35 +122,56 @@ function parseExtractedJson(text) {
  * @param {string} [params.requestId]
  * @returns {Promise<{ extracted: object, raw: string, model: string, pages: number }>}
  */
-async function runCodex({ imagePaths, prompt, schemaHint, requestId }) {
+async function runCodex({ imagePaths, prompt, schemaHint, requestId, workDir }) {
   if (!imagePaths || imagePaths.length === 0) {
     throw new Error('At least one image path is required for Codex extraction');
   }
 
   const bin = process.env.CODEX_BIN || 'codex';
   const model = process.env.CODEX_MODEL || 'gpt-5';
+  const timeoutMs = Number(process.env.CODEX_TIMEOUT_MS || 180000);
   const reqId = requestId || `req-${Date.now()}`;
-  const outFile = path.join(os.tmpdir(), `codex-out-${reqId.replace(/[^a-zA-Z0-9_-]/g, '_')}.txt`);
+  const baseDir = workDir || os.tmpdir();
+  const outFile = path.join(baseDir, `codex-out-${reqId.replace(/[^a-zA-Z0-9_-]/g, '_')}.txt`);
 
   const schema = schemaHint || DEFAULT_SCHEMA_HINT;
   const userPrompt = prompt || DEFAULT_PROMPT;
   const fullPrompt = `${userPrompt}\n\nSchema:\n${schema}\n\nReturn ONLY valid JSON, no markdown fences or prose.`;
 
   const imageArg = imagePaths.join(',');
-  const args = ['exec'];
+  // Do not use --sandbox read-only: it can prevent -o from writing the final message file.
+  const args = ['exec', '--skip-git-repo-check', '--ask-for-approval', 'never'];
+  if (workDir) {
+    args.push('--cd', workDir);
+  }
   if (model) {
     args.push('--model', model);
   }
-  args.push('--image', imageArg, '-o', outFile, fullPrompt);
+  // Codex CLI: with --image, prompt must follow `--` or it is parsed as another path
+  args.push('--image', imageArg, '-o', outFile, '--', fullPrompt);
 
+  const extra = process.env.CODEX_EXTRA_ARGS;
+  if (extra) {
+    args.splice(1, 0, ...extra.split(/\s+/).filter(Boolean));
+  }
+
+  console.error(`[codex] starting: ${bin} ${args.slice(0, 10).join(' ')} ... -> ${outFile}`);
+
+  let stdout = '';
+  let stderr = '';
   try {
-    await execFileAsync(bin, args, {
+    const result = await execFileAsync(bin, args, {
       env: process.env,
-      timeout: 120000,
+      timeout: timeoutMs,
       maxBuffer: 20 * 1024 * 1024,
     });
+    stdout = result.stdout?.toString() || '';
+    stderr = result.stderr?.toString() || '';
   } catch (err) {
-    const msg = err.stderr?.toString() || err.stdout?.toString() || err.message;
+    stdout = err.stdout?.toString() || '';
+    stderr = err.stderr?.toString() || err.message || '';
+    const msg = stderr || stdout || err.message;
+    console.error(`[codex] failed: ${String(msg).slice(0, 300)}`);
     throw new Error(`Codex CLI failed: ${String(msg).slice(0, 500)}`);
   }
 
@@ -162,6 +183,18 @@ async function runCodex({ imagePaths, prompt, schemaHint, requestId }) {
     } catch {
       /* ignore */
     }
+  }
+  if (!raw.trim() && stdout.trim()) {
+    raw = stdout;
+    console.error('[codex] used stdout fallback (output file was empty)');
+  }
+
+  if (!raw.trim()) {
+    console.error(
+      `[codex] empty output; outFile=${outFile} exists=${fs.existsSync(outFile)} stderr=${stderr.slice(0, 200)}`
+    );
+  } else {
+    console.error(`[codex] finished, ${raw.length} chars from Codex`);
   }
 
   const extracted = parseExtractedJson(raw);
