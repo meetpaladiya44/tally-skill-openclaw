@@ -604,7 +604,7 @@ Sanity-check Codex alone (should print invoice fields in ~1–3 min):
 
 ```bash
 OUT=/tmp/codex-manual-test.txt
-time codex exec --skip-git-repo-check --ask-for-approval never \
+time codex exec --skip-git-repo-check --full-auto \
   --image /home/ubuntu/samples/invoice-page-1.png \
   -o "$OUT" -- "Return JSON with invoice_no and total only."
 cat "$OUT"
@@ -815,6 +815,7 @@ Production should still be: **extractor on EC2**, **OpenClaw + Tally on client**
 | `codex exec` fails | Check Plus subscription; try `codex exec --image` with a small PNG first |
 | `pdftoppm: command not found` | `sudo apt install poppler-utils` |
 | `EXTRACTION_FAILED` | `pm2 logs extractor`; test `codex exec --image` manually |
+| `unexpected argument '--ask-for-approval'` | `git pull` + `pm2 restart extractor` (older Codex CLI; service now uses `--full-auto`) |
 | `Empty Codex response` | `git pull` + `pm2 restart extractor`; test `codex exec -o /tmp/t.txt` manually; see F6 note above |
 | curl hangs, no output | Normal for 1–5 min; use `pm2 logs extractor`; add `--max-time 180`; don't use Ctrl+C early |
 | Codex stuck in PM2 | Add to `.env`: `CODEX_EXTRA_ARGS=--dangerously-bypass-approvals-and-sandbox`, then `pm2 restart extractor` |

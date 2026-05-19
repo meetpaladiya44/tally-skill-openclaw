@@ -131,29 +131,36 @@ async function runCodex({ imagePaths, prompt, schemaHint, requestId, workDir }) 
   const model = process.env.CODEX_MODEL || 'gpt-5';
   const timeoutMs = Number(process.env.CODEX_TIMEOUT_MS || 180000);
   const reqId = requestId || `req-${Date.now()}`;
-  const baseDir = workDir || os.tmpdir();
+  const absWorkDir = workDir ? path.resolve(workDir) : null;
+  const baseDir = absWorkDir || os.tmpdir();
   const outFile = path.join(baseDir, `codex-out-${reqId.replace(/[^a-zA-Z0-9_-]/g, '_')}.txt`);
+  const absImages = imagePaths.map((p) => path.resolve(p));
+  const imageArg = absImages.join(',');
 
   const schema = schemaHint || DEFAULT_SCHEMA_HINT;
   const userPrompt = prompt || DEFAULT_PROMPT;
   const fullPrompt = `${userPrompt}\n\nSchema:\n${schema}\n\nReturn ONLY valid JSON, no markdown fences or prose.`;
 
-  const imageArg = imagePaths.join(',');
-  // Do not use --sandbox read-only: it can prevent -o from writing the final message file.
-  const args = ['exec', '--skip-git-repo-check', '--ask-for-approval', 'never'];
-  if (workDir) {
-    args.push('--cd', workDir);
+  // Headless PM2: --full-auto (not --ask-for-approval; unsupported on many codex exec builds).
+  const args = ['exec', '--skip-git-repo-check', '--full-auto'];
+  const extraParts = (process.env.CODEX_EXTRA_ARGS || '').split(/\s+/).filter(Boolean);
+  const hasAuto =
+    extraParts.some((p) => p.includes('full-auto')) ||
+    extraParts.some((p) => p.includes('bypass-approvals'));
+  if (hasAuto) {
+    args.pop(); // drop default --full-auto when caller overrides via CODEX_EXTRA_ARGS
+  }
+  if (extraParts.length) {
+    args.push(...extraParts);
+  }
+  if (absWorkDir) {
+    args.push('--cd', absWorkDir);
   }
   if (model) {
     args.push('--model', model);
   }
   // Codex CLI: with --image, prompt must follow `--` or it is parsed as another path
   args.push('--image', imageArg, '-o', outFile, '--', fullPrompt);
-
-  const extra = process.env.CODEX_EXTRA_ARGS;
-  if (extra) {
-    args.splice(1, 0, ...extra.split(/\s+/).filter(Boolean));
-  }
 
   console.error(`[codex] starting: ${bin} ${args.slice(0, 10).join(' ')} ... -> ${outFile}`);
 
