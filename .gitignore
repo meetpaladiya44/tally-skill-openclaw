@@ -1,17 +1,15 @@
 # Dependencies
-bridge-service/node_modules/
+extractor-service/node_modules/
 
 # Secrets - NEVER commit
 .env
 .env*
-bridge-service/.env
+extractor-service/.env
 *.env.local
 
-# Idempotency cache
-bridge-service/data/
-
-.cursor/
-dev-testing.md
+# Cache / uploads
+extractor-service/data/
+extractor-service/uploads/
 
 # OS files
 .DS_Store

@@ -1,22 +1,27 @@
 ---
 emoji: 🧾
 name: tally-prime-ca
-version: 1.0.9
+version: 1.1.0
 author: Maxxit
 description: >-
-  Instance B skill for TallyPrime (Poster). Receives pre-extracted JSON from
-  the bridge service and posts vouchers (purchase/sales/payment/receipt/journal,
-  credit note, debit note, contra) via TallyPrime XML-over-HTTP. Also reads
-  accounting reports (day book, trial balance, P&L, balance sheet, outstandings,
-  GST). PDF/image extraction is handled by tally-extractor-skill on Instance A.
+  Full-service CA skill for TallyPrime running locally. Read accounting reports
+  (day book, trial balance, P&L, balance sheet, outstandings, GST) and post or
+  update vouchers (purchase/sales/payment/receipt/journal, credit note, debit
+  note, contra) via TallyPrime XML-over-HTTP. Use when the user mentions Tally,
+  accounting entries, invoices/bills, ledgers, outstanding, GST, returns, or
+  financial statements.
 disableModelInvocation: false
 requires:
   env:
     - TALLY_URL
+    - EXTRACTOR_URL
+    - EXTRACTOR_BEARER
 metadata:
   openclaw:
     requiredEnv:
       - TALLY_URL
+      - EXTRACTOR_URL
+      - EXTRACTOR_BEARER
     bins:
       - curl
       - tallyca
@@ -30,18 +35,15 @@ Connect to a **locally running** TallyPrime instance via its **XML-over-HTTP** i
 - **No cloud API**: TallyPrime must be open/running on the user’s machine.
 - **Multi-company**: Always use the correct `SVCURRENTCOMPANY` (exact spelling).
 
-## Hero Use Case: Bridge JSON → Tally entry
-
-This skill receives **pre-extracted invoice data** as a canonical JSON payload from the bridge service (see `reference/bridge-input.md` for schema). PDF/image extraction is handled by a separate **tally-extractor-skill** running on Instance A.
+## Hero Use Case: WhatsApp invoice → Tally entry
 
 Goal: zero manual entry for CAs handling many clients.
 
-1. Receive validated JSON payload from bridge (company, party, GSTIN, date, invoice no, items, taxes, total).
+0. When the user sends a **PDF or image**, call the hosted extractor at `$EXTRACTOR_URL/v1/extract` (ChatGPT Plus via Codex CLI on your server). **Do not** vision-read or OCR the file locally in OpenClaw.
+1. Use the returned `extracted` fields: company, party, GSTIN, date, invoice no, taxable, tax, total, ledger mapping.
 2. Ensure masters exist: party ledger, purchase/sales ledger, GST ledger(s), bank/cash ledger (if needed).
-3. Post voucher with a **unique GUID** (the `idempotency_key` from the JSON).
-4. Return structured result to the bridge for relay to the user.
-
-**Important:** This skill does **not** parse PDFs or images. All document extraction happens on Instance A (`tally-extractor-skill`). This skill only processes structured JSON input via the bridge HTTP endpoint.
+3. Post voucher with a **unique GUID**.
+4. Confirm a summary back to the user.
 
 ## PDF Generation from Text (Invoice / Receipt)
 
@@ -204,11 +206,8 @@ That way OpenClaw instructions and the installed CLI stay aligned; the agent onl
 
 ## When to use this skill
 
-**Scope note:** This skill is for **Instance B** (Tally Poster). It does **not** parse PDFs or images — that responsibility belongs to `tally-extractor-skill` on Instance A. This skill receives structured JSON from the bridge and posts to TallyPrime.
+Use when the user asks to:
 
-Use when:
-
-- Receiving JSON payloads from the bridge (`/v1/post-voucher`) — validate and post to Tally
 - **Generate PDF**: create invoice PDF, receipt PDF, or any document from text/data (use `tallyca` CLI)
 - Post entries: purchase, sales, receipt, payment, journal, contra, credit note, debit note
 - Check reports: day book, trial balance, balance sheet, profit & loss, ledger statement, outstandings, GST
@@ -232,6 +231,7 @@ Responses to users must be written for accountants, not developers. After Tally 
 9. **Accounting-only vouchers (no inventory items)**: set `<ISINVOICE>No</ISINVOICE>` and place the **party ledger entry first** in the `ALLLEDGERENTRIES.LIST` sequence. This makes the Day Book "Particulars" column show the party name (not the expense/purchase ledger) and defaults the voucher to the clean "As Voucher" view. Only use `ISINVOICE=Yes` for item invoices that go through `reference/inventory.md`.
 10. **Accounting Invoice Mode — always use `LEDGERENTRIES.LIST`**: when `OBJVIEW="Invoice Voucher View"` is set (Modes 1 and 2 in `reference/vouchers.md`), every ledger block **must** use `<LEDGERENTRIES.LIST>`, not `<ALLLEDGERENTRIES.LIST>`. Tally silently ignores `ALLLEDGERENTRIES` in this view, causing the voucher to be saved with no entries and the error "No accounting or inventory entries are available."
 11. **Voucher class decision — confirm before posting**: before posting any Purchase or Sales voucher, check whether the company's voucher type uses a class for GST splitting. Run the preflight checklist in the "Preflight checklist before posting" section below. If class mode is confirmed, set `<CLASSNAME>EXACT_CLASS_NAME</CLASSNAME>` in the voucher header and include all four GST header fields (`CMPGSTIN`, `PARTYGSTIN`, `GSTREGISTRATIONTYPE`, `PLACEOFSUPPLY`). **If class existence is unconfirmed, stop and ask — do not post without it.** Full decision rules and templates are in the "Voucher class — decision rules" section of `reference/vouchers.md`.
+12. **Use the hosted extractor for PDF/images**: for any bill/invoice file from WhatsApp or Telegram, call `$EXTRACTOR_URL/v1/extract` first. Do not use local vision/OCR. If extraction fails or confidence is low, ask the user to confirm fields before posting.
 
 ## Preflight checklist before posting
 
@@ -261,6 +261,53 @@ Expected (example):
 ```
 
 If not running, stop and ask user to open TallyPrime and enable integrations for the port.
+
+## Step 1a: Extract document via hosted extractor (PDF / image only)
+
+When the user attaches a PDF or image (invoice, bill, credit note scan), **before** company or ledger steps:
+
+### 1a.1 Check extractor health
+
+```bash
+curl -s -H "Authorization: Bearer $EXTRACTOR_BEARER" "$EXTRACTOR_URL/v1/health"
+```
+
+Expected: `"status":"ok"` and ideally `"codex_logged_in":true`. If `codex_logged_in` is false, tell the user the extraction service needs Codex login on the server (not a Tally issue).
+
+### 1a.2 Upload file for extraction
+
+Save the user's attachment to a local path (e.g. `./incoming.pdf`), then:
+
+```bash
+curl -s -X POST "$EXTRACTOR_URL/v1/extract" \
+  -H "Authorization: Bearer $EXTRACTOR_BEARER" \
+  -H "Idempotency-Key: <stable-key-from-invoice-no-and-date>" \
+  -F "file=@./incoming.pdf" \
+  -F "prompt=Extract GST invoice fields for Tally voucher posting" \
+  -F 'schema_hint={"party":"","party_gstin":"","company_gstin":"","invoice_no":"","date":"YYYY-MM-DD","voucher_type":"Purchase","items":[{"description":"","hsn":"","qty":0,"rate":0,"amount":0}],"cgst":0,"sgst":0,"igst":0,"taxable_amount":0,"total":0,"confidence":{"overall":0,"fields":{}}}'
+```
+
+**Response (success):**
+
+```json
+{
+  "status": "ok",
+  "request_id": "...",
+  "extracted": { "party": "...", "invoice_no": "...", "total": 46199.83 },
+  "raw": "...",
+  "pages": 1,
+  "model": "gpt-5"
+}
+```
+
+### 1a.3 Use extracted data
+
+- Map `extracted` fields into voucher posting (party, date, amounts, GST, items).
+- If `extracted.confidence.overall` &lt; 0.7 or key fields are null, **ask the user** to confirm before posting.
+- If `status` is `error`, relay `message` in plain language; do not guess missing fields.
+- For **text-only** messages (no file), skip this step and parse the text directly.
+
+Then continue to **Step 1** (company context).
 
 ## Step 1: Company context
 
@@ -355,71 +402,8 @@ When importing bank statement transactions (PDF/Excel from bank), use the mappin
 - Before posting, fetch all ledger names using `reference/reports.md` → "Ledger Names (all ledgers)" and confirm once with the user: “These are the ledgers I will use for the bank entries: ...”. Do not post until the user confirms the ledger mapping.
 - Full XML templates for common bank transactions (NEFT, RTGS, UPI, charges)
 
-## Bridge input contract
-
-When receiving JSON from the bridge service (`/v1/post-voucher`), this skill expects a canonical JSON payload. Full schema and per-voucher-type required fields are documented in `reference/bridge-input.md`.
-
-Key mapping rules (JSON → Tally XML):
-
-| JSON field | Tally XML element | Notes |
-|---|---|---|
-| `voucher.date` (`YYYY-MM-DD`) | `DATE` (`YYYYMMDD`) | Remove dashes |
-| `voucher.type` | `VOUCHERTYPENAME` | Exact enum match |
-| `voucher.is_invoice_mode=true` | `OBJVIEW="Invoice Voucher View"` | Use `LEDGERENTRIES.LIST` (rule 10) |
-| `voucher.voucher_class` | `CLASSNAME` | Exact spelling from Tally |
-| `voucher.bill_allocations[]` | `BILLALLOCATIONS.LIST` | Nested under party ledger entry |
-| `idempotency_key` | `GUID` | Used for deduplication |
-
-When processing bridge input:
-
-1. Validate JSON against schema in `reference/bridge-input.md`
-2. Run the preflight checklist (section above)
-3. Create missing masters if needed
-4. Build XML using templates in `reference/vouchers.md`
-5. Return result: `{status, guid, voucher_number, summary, masters_created[]}`
-
-If any required field is missing or invalid, return `needs_clarification` with the missing field names — do not invent data.
-
-## Deployment topology
-
-Instance B is the **Tally Poster**. It does not expose Telegram or WhatsApp. All user chat happens on Instance A; B only receives JSON via `bridge-service`.
-
-```mermaid
-flowchart LR
-  User["Telegram user"] --> A["Instance A\nCodex Plus + extractor skill"]
-  A -->|"POST /v1/post-voucher"| Bridge["bridge-service :8787"]
-  Bridge --> B["Instance B\nOpenAI API + tally-skill"]
-  B --> Tally["TallyPrime :9000"]
-```
-
-| Environment | Where B runs | Tally URL | Bridge exposure |
-|---|---|---|---|
-| **Production** | Client mini-PC with TallyPrime | `http://localhost:9000` | `ngrok http 8787` (or Cloudflare Tunnel) |
-| **Dev** | Same EC2 as A (second OpenClaw) | ngrok URL to dev Tally | `localhost:8787` or ngrok |
-
-**Production:** No ngrok needed for Tally — only the bridge port is tunneled inbound for A.
-
-**Dev:** Both OpenClaws on one Ubuntu EC2; B uses your existing Tally ngrok URL in `TALLY_URL`.
-
-## Instance B configuration checklist
-
-| Step | Setting | Value |
-|---|---|---|
-| 1 | Host | Client mini-PC (prod) or same EC2 (dev) |
-| 2 | Install | Node.js, OpenClaw, `npm install -g tallyca`, Tally OS deps (see PDF section) |
-| 3 | LLM | OpenAI **API key** (per-client billing) |
-| 4 | Skill loaded | `tally-skill/` only — **do not** load `tally-extractor-skill/` |
-| 5 | `TALLY_URL` | `http://localhost:9000` (prod) or dev ngrok Tally URL |
-| 6 | `TALLYCA_PDF_BACKEND` | `auto` or `pdfmake` on headless Linux |
-| 7 | Bridge | `cd bridge-service && npm i && node server.js` on port 8787 |
-| 8 | Tunnel | `ngrok http 8787` — give URL + bearer + HMAC secret to Instance A team |
-| 9 | **Do not set** | `BRIDGE_URL` on Instance B (bridge is the server, not a client) |
-| 10 | OpenClaw adapter | `OPENCLAW_MODE=cli` or `http` per your install |
-| 11 | Health | From A: `GET $BRIDGE_URL/v1/health` must return `tally: ok` before posting |
-
 ## Advanced reference
 
-- **Bridge input schema**: `reference/bridge-input.md`
 - Reports and data export: `reference/reports.md`
 - Voucher templates (including Debit/Credit Note, Contra, bill-wise allocations, alter/cancel): `reference/vouchers.md`
 - Masters (ledgers/groups + GST/address, alteration): `reference/masters.md`
