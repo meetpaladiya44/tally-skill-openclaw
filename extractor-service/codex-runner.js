@@ -1,6 +1,6 @@
 'use strict';
 
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -41,6 +41,58 @@ const DEFAULT_SCHEMA_HINT = JSON.stringify(
 
 const DEFAULT_PROMPT =
   'Extract all invoice or bill fields from the attached document image(s). Return ONLY valid JSON matching the schema. Include per-field confidence 0-1 in confidence.fields. Do not invent values; use null for missing fields.';
+
+/**
+ * Run a command with prompt on stdin (Codex reads instructions when argv ends with `-`).
+ * @param {string} bin
+ * @param {string[]} args
+ * @param {string} stdinText
+ * @param {number} timeoutMs
+ * @returns {Promise<{ stdout: string, stderr: string, code: number }>}
+ */
+function spawnWithStdin(bin, args, stdinText, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, {
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGTERM');
+      reject(new Error(`Codex CLI timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ stdout, stderr, code: code ?? 1 });
+    });
+
+    child.stdin.write(stdinText);
+    child.stdin.end();
+  });
+}
 
 /**
  * Check whether Codex CLI appears logged in (auth file present).
@@ -120,6 +172,7 @@ function parseExtractedJson(text) {
  * @param {string} [params.prompt]
  * @param {string} [params.schemaHint]
  * @param {string} [params.requestId]
+ * @param {string} [params.workDir]
  * @returns {Promise<{ extracted: object, raw: string, model: string, pages: number }>}
  */
 async function runCodex({ imagePaths, prompt, schemaHint, requestId, workDir }) {
@@ -135,20 +188,28 @@ async function runCodex({ imagePaths, prompt, schemaHint, requestId, workDir }) 
   const baseDir = absWorkDir || os.tmpdir();
   const outFile = path.join(baseDir, `codex-out-${reqId.replace(/[^a-zA-Z0-9_-]/g, '_')}.txt`);
   const absImages = imagePaths.map((p) => path.resolve(p));
-  const imageArg = absImages.join(',');
 
   const schema = schemaHint || DEFAULT_SCHEMA_HINT;
   const userPrompt = prompt || DEFAULT_PROMPT;
   const fullPrompt = `${userPrompt}\n\nSchema:\n${schema}\n\nReturn ONLY valid JSON, no markdown fences or prose.`;
 
-  // Headless PM2: --full-auto (not --ask-for-approval; unsupported on many codex exec builds).
-  const args = ['exec', '--skip-git-repo-check', '--full-auto'];
+  if (absWorkDir) {
+    try {
+      fs.writeFileSync(path.join(absWorkDir, 'prompt.txt'), fullPrompt, 'utf8');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const args = ['exec', '--skip-git-repo-check', '-s', 'workspace-write'];
   const extraParts = (process.env.CODEX_EXTRA_ARGS || '').split(/\s+/).filter(Boolean);
-  const hasAuto =
-    extraParts.some((p) => p.includes('full-auto')) ||
+  const hasSandboxOverride =
+    extraParts.some((p) => p === '-s') ||
+    extraParts.some((p) => p.startsWith('--sandbox')) ||
     extraParts.some((p) => p.includes('bypass-approvals'));
-  if (hasAuto) {
-    args.pop(); // drop default --full-auto when caller overrides via CODEX_EXTRA_ARGS
+  if (hasSandboxOverride) {
+    args.pop();
+    args.pop(); // drop default -s workspace-write
   }
   if (extraParts.length) {
     args.push(...extraParts);
@@ -159,27 +220,30 @@ async function runCodex({ imagePaths, prompt, schemaHint, requestId, workDir }) 
   if (model) {
     args.push('--model', model);
   }
-  // Codex CLI: with --image, prompt must follow `--` or it is parsed as another path
-  args.push('--image', imageArg, '-o', outFile, '--', fullPrompt);
+  for (const img of absImages) {
+    args.push('-i', img);
+  }
+  args.push('-o', outFile, '-');
 
-  console.error(`[codex] starting: ${bin} ${args.slice(0, 10).join(' ')} ... -> ${outFile}`);
+  const logArgs = args.filter((a) => a !== '-').slice(0, 14).join(' ');
+  console.error(`[codex] starting: ${bin} ${logArgs} ... (prompt on stdin) -> ${outFile}`);
 
   let stdout = '';
   let stderr = '';
   try {
-    const result = await execFileAsync(bin, args, {
-      env: process.env,
-      timeout: timeoutMs,
-      maxBuffer: 20 * 1024 * 1024,
-    });
-    stdout = result.stdout?.toString() || '';
-    stderr = result.stderr?.toString() || '';
+    const result = await spawnWithStdin(bin, args, fullPrompt, timeoutMs);
+    stdout = result.stdout;
+    stderr = result.stderr;
+    if (result.code !== 0) {
+      const msg = stderr || stdout || `exit code ${result.code}`;
+      console.error(`[codex] failed: ${String(msg).slice(0, 300)}`);
+      throw new Error(`Codex CLI failed: ${String(msg).slice(0, 500)}`);
+    }
   } catch (err) {
-    stdout = err.stdout?.toString() || '';
-    stderr = err.stderr?.toString() || err.message || '';
-    const msg = stderr || stdout || err.message;
-    console.error(`[codex] failed: ${String(msg).slice(0, 300)}`);
-    throw new Error(`Codex CLI failed: ${String(msg).slice(0, 500)}`);
+    if (!err.message?.includes('Codex CLI failed')) {
+      console.error(`[codex] failed: ${String(err.message).slice(0, 300)}`);
+    }
+    throw err;
   }
 
   let raw = '';
@@ -240,6 +304,7 @@ module.exports = {
   runCodex,
   prepareImagePaths,
   isCodexLoggedIn,
+  parseExtractedJson,
   DEFAULT_SCHEMA_HINT,
   DEFAULT_PROMPT,
 };

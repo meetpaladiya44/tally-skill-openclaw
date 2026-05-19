@@ -145,6 +145,17 @@ app.post('/v1/extract', verifyBearer, upload.single('file'), async (req, res) =>
       workDir,
     });
 
+    const emptyResponse =
+      !result.raw?.trim() || result.extracted?.parse_error === 'Empty Codex response';
+    if (emptyResponse) {
+      return res.status(502).json({
+        status: 'error',
+        error_code: 'EXTRACTION_FAILED',
+        message: 'Codex returned no extractable output',
+        request_id: requestId,
+      });
+    }
+
     const response = {
       status: 'ok',
       request_id: requestId,

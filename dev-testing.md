@@ -548,13 +548,13 @@ Terminal 1 — watch logs:
 pm2 logs extractor --lines 0
 ```
 
-Terminal 2 — run extract (180s max wait; shows errors if any):
+Terminal 2 — run extract (300s max wait; shows errors if any):
 
 ```bash
 cd /opt/tally/tally-aws-all-config/extractor-service
 export EXTRACTOR_BEARER=$(grep '^EXTRACTOR_BEARER=' .env | cut -d= -f2-)
 
-curl --max-time 180 -X POST http://127.0.0.1:8080/v1/extract \
+curl --max-time 300 -X POST http://127.0.0.1:8080/v1/extract \
   -H "Authorization: Bearer $EXTRACTOR_BEARER" \
   -F "file=@/home/ubuntu/samples/invoice-page-1.png" | jq .
 ```
@@ -589,7 +589,7 @@ Watch logs if it fails:
 pm2 logs extractor --lines 80
 ```
 
-**`parse_error: "Empty Codex response"`** — Codex ran but the CLI wrote no text to the `-o` file (often caused by an old build using `--sandbox read-only`). Fix:
+**`EXTRACTION_FAILED` / empty output / `Reading additional input from stdin` in PM2 logs** — the service must pipe the prompt on stdin (argv prompt is ignored by many Codex builds). Fix:
 
 ```bash
 cd /opt/tally/tally-aws-all-config
@@ -600,17 +600,25 @@ pm2 logs extractor --lines 0
 # retry F6 curl in another terminal
 ```
 
-Sanity-check Codex alone (should print invoice fields in ~1–3 min):
+Sanity-check Codex alone with **stdin prompt** (matches how the service runs; ~1–5 min):
 
 ```bash
 OUT=/tmp/codex-manual-test.txt
-time codex exec --skip-git-repo-check --full-auto \
-  --image /home/ubuntu/samples/invoice-page-1.png \
-  -o "$OUT" -- "Return JSON with invoice_no and total only."
+printf '%s' 'Return JSON with invoice_no and total only.' | \
+  time codex exec --skip-git-repo-check -s workspace-write \
+    -i /home/ubuntu/samples/invoice-page-1.png \
+    -o "$OUT" -
 cat "$OUT"
 ```
 
-If `cat` is empty but `codex exec` exits 0, add to `.env`: `CODEX_EXTRA_ARGS=--dangerously-bypass-approvals-and-sandbox`, then `pm2 restart extractor`.
+If `cat` is empty but `codex exec` exits 0, add to `.env`:
+
+```env
+CODEX_EXTRA_ARGS=--dangerously-bypass-approvals-and-sandbox
+CODEX_TIMEOUT_MS=300000
+```
+
+Then `pm2 restart extractor`.
 
 ---
 
@@ -815,9 +823,10 @@ Production should still be: **extractor on EC2**, **OpenClaw + Tally on client**
 | `codex exec` fails | Check Plus subscription; try `codex exec --image` with a small PNG first |
 | `pdftoppm: command not found` | `sudo apt install poppler-utils` |
 | `EXTRACTION_FAILED` | `pm2 logs extractor`; test `codex exec --image` manually |
-| `unexpected argument '--ask-for-approval'` | `git pull` + `pm2 restart extractor` (older Codex CLI; service now uses `--full-auto`) |
-| `Empty Codex response` | `git pull` + `pm2 restart extractor`; test `codex exec -o /tmp/t.txt` manually; see F6 note above |
-| curl hangs, no output | Normal for 1–5 min; use `pm2 logs extractor`; add `--max-time 180`; don't use Ctrl+C early |
+| `unexpected argument '--ask-for-approval'` | `git pull` + `pm2 restart extractor` (older Codex CLI) |
+| `Reading additional input from stdin` in logs | Old build — `git pull` + `pm2 restart`; service must pipe prompt on stdin |
+| `EXTRACTION_FAILED` / empty `extracted` | `git pull` + restart; run stdin manual test in F6; add `CODEX_EXTRA_ARGS` bypass |
+| curl hangs, no output | Normal for 1–5 min; use `pm2 logs extractor`; use `--max-time 300`; don't use Ctrl+C early |
 | Codex stuck in PM2 | Add to `.env`: `CODEX_EXTRA_ARGS=--dangerously-bypass-approvals-and-sandbox`, then `pm2 restart extractor` |
 | `401 Unauthorized` | `EXTRACTOR_BEARER` mismatch between client and EC2 `.env` |
 | SCP permission denied | `chmod 600 key.pem` / `icacls` on Windows |
