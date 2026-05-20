@@ -1100,15 +1100,22 @@ pm2 describe openclaw-tally
 # Note the pm2 id, then:
 pm2 env <id>
 
-# Skills loaded
-openclaw skill list
+# Skills loaded (CLI uses plural `skills`)
+openclaw skills list
+openclaw skills --help
 ```
 
-**Use only one tally skill for testing.** If both `tally-prime-ca` (local repo) and a ClawHub `tally-skill` appear, remove the ClawHub copy:
+**Use only one tally skill for testing.** If both `tally-prime-ca` (local repo) and a ClawHub install appear, remove the duplicate. OpenClaw versions differ:
 
 ```bash
-openclaw skill remove tally-skill
-openclaw skill list
+# Prefer official CLI if available (see output of --help)
+openclaw skills list --verbose
+
+# If there is no `remove` / `uninstall` subcommand on your build, delete the
+# extra skill folder under your agent workspace, e.g.:
+# ls ~/.openclaw/workspace/skills/
+# rm -rf ~/.openclaw/workspace/skills/<duplicate-skill-folder>
+# Then: openclaw skills list
 ```
 
 Re-register local skill if needed:
@@ -1144,32 +1151,34 @@ If you see **no** `[extract] start` with your PDF filename, the bot did **not** 
 
 ---
 
-### I5c — Stop rogue OpenClaw daemons (only PM2 should answer Telegram)
+### I5c — Gateway vs `openclaw-tally` (do not kill blindly)
 
-`openclaw onboard` may have started a background gateway that still owns your Telegram bot. That process usually **lacks** `EXTRACTOR_URL` / `EXTRACTOR_BEARER`.
+OpenClaw often runs **two** processes on purpose:
 
-**Where:** EC2 SSH.
+| PID / process | Typical role |
+|---------------|----------------|
+| `openclaw gateway --port 18789` | WebSocket server: Telegram and other channels connect here |
+| `openclaw-tally` (PM2) | `openclaw serve …` — agent + skills; may connect to the gateway |
+
+**Do not `kill` the gateway** unless you know Telegram is handled entirely by PM2 and you have restarted the gateway inside PM2 with the same token. Killing `gateway` usually **breaks Telegram** until you start it again (`openclaw gateway` or your chosen layout).
+
+**What to check instead:**
 
 ```bash
-ps -ef | grep -i openclaw | grep -v grep
+pm2 describe openclaw-tally
+# Full `script` + `args` should show something like: openclaw serve --skill tally-prime-ca
+pm2 env 1
+# Must include EXTRACTOR_URL and EXTRACTOR_BEARER for the agent that runs curl to the extractor
 ```
 
-For each PID **not** listed under `pm2 list` as `openclaw-tally`, stop it:
-
-```bash
-kill <PID>
-# or if it respawns:
-pkill -f 'openclaw.*gateway'
-```
-
-Then ensure only PM2 runs the bot:
+If Telegram works but extractor is never hit, the **agent** that handles the session may not inherit PM2 env (OpenClaw config / workspace issue). Fix by setting extractor vars in the **same** place OpenClaw loads agent env (often workspace or `~/.openclaw/openclaw.json` — check your OpenClaw version docs), then restart gateway + PM2:
 
 ```bash
 pm2 restart openclaw-tally
-pm2 logs openclaw-tally --lines 0
+# If you changed config, restart gateway too (however you start it: systemd, screen, or add gateway to PM2)
 ```
 
-Send `/start` on Telegram again and repeat I5b smoke run.
+**When it *is* safe to kill a process:** only a **second** stray `openclaw serve` or duplicate gateway on a **different** port/token that is not in your intended setup. Compare PIDs to `pm2 list` before `kill`.
 
 ---
 
