@@ -59,6 +59,11 @@ function rmDirRecursive(dir) {
   fs.rmdirSync(dir);
 }
 
+/** @param {string} msg */
+function logExtract(msg) {
+  console.log(`[extract] ${msg}`);
+}
+
 loadCache();
 
 const storage = multer.diskStorage({
@@ -105,6 +110,9 @@ app.post('/v1/extract', verifyBearer, upload.single('file'), async (req, res) =>
   const idemKey = req.headers['idempotency-key'];
   if (idemKey && idempotencyCache.has(idemKey)) {
     const cached = idempotencyCache.get(idemKey);
+    logExtract(
+      `cache-hit idempotency-key=${idemKey.slice(0, 40)} request_id=${cached.request_id || 'unknown'} ip=${req.ip}`
+    );
     return res.status(200).json({ ...cached, duplicate: true });
   }
 
@@ -135,8 +143,24 @@ app.post('/v1/extract', verifyBearer, upload.single('file'), async (req, res) =>
       });
     }
 
-    console.log(`extract start request_id=${requestId} file=${req.file.originalname}`);
+    const mime = (req.file.mimetype || '').toLowerCase();
+    const ua = (req.headers['user-agent'] || '-').slice(0, 120);
+    logExtract(
+      `start request_id=${requestId} file=${req.file.originalname} mime=${mime} size=${req.file.size} ip=${req.ip} ua="${ua}" idempotency-key=${idemKey || '-'}`
+    );
+
     const imagePaths = await prepareImagePaths(req.file, workDir);
+    const isPdf = mime === 'application/pdf';
+    if (isPdf) {
+      logExtract(
+        `pdf-converted request_id=${requestId} pages=${imagePaths.length} images=${imagePaths.map((p) => path.basename(p)).join(',')}`
+      );
+    } else {
+      logExtract(
+        `image-ready request_id=${requestId} pages=${imagePaths.length} path=${imagePaths[0] ? path.basename(imagePaths[0]) : '-'}`
+      );
+    }
+
     const result = await runCodex({
       imagePaths,
       prompt,
@@ -148,6 +172,7 @@ app.post('/v1/extract', verifyBearer, upload.single('file'), async (req, res) =>
     const emptyResponse =
       !result.raw?.trim() || result.extracted?.parse_error === 'Empty Codex response';
     if (emptyResponse) {
+      logExtract(`failed request_id=${requestId} reason=empty_codex_output pages=${result.pages}`);
       return res.status(502).json({
         status: 'error',
         error_code: 'EXTRACTION_FAILED',
@@ -169,10 +194,14 @@ app.post('/v1/extract', verifyBearer, upload.single('file'), async (req, res) =>
       saveCacheEntry(idemKey, response);
     }
 
-    console.log(`extract done request_id=${requestId} pages=${result.pages}`);
+    const inv = result.extracted?.invoice_no || result.extracted?.party || '-';
+    logExtract(
+      `done request_id=${requestId} pages=${result.pages} model=${result.model} raw_chars=${result.raw?.length || 0} invoice_hint=${String(inv).slice(0, 40)}`
+    );
     return res.status(200).json(response);
   } catch (err) {
-    console.error('extract error:', err.message);
+    logExtract(`error request_id=${requestId} message=${String(err.message).slice(0, 200)}`);
+    console.error('[extract] stack:', err.stack?.split('\n').slice(0, 3).join(' | ') || err.message);
     return res.status(502).json({
       status: 'error',
       error_code: 'EXTRACTION_FAILED',

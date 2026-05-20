@@ -39,11 +39,11 @@ Connect to a **locally running** TallyPrime instance via its **XML-over-HTTP** i
 
 Goal: zero manual entry for CAs handling many clients.
 
-0. When the user sends a **PDF or image**, call the hosted extractor at `$EXTRACTOR_URL/v1/extract` (ChatGPT Plus via Codex CLI on your server). **Do not** vision-read or OCR the file locally in OpenClaw.
+0. When the user sends a **PDF or image**, call the hosted extractor at `$EXTRACTOR_URL/v1/extract` (ChatGPT Plus via Codex CLI on your server). **Do not** vision-read or OCR the file locally in OpenClaw. **Do not** use the onboard LLM to read the attachment.
 1. Use the returned `extracted` fields: company, party, GSTIN, date, invoice no, taxable, tax, total, ledger mapping.
 2. Ensure masters exist: party ledger, purchase/sales ledger, GST ledger(s), bank/cash ledger (if needed).
 3. Post voucher with a **unique GUID**.
-4. Confirm a summary back to the user.
+4. Confirm a summary back to the user. **Always include** `Extractor request_id: <request_id from /v1/extract JSON>` in the final message so the user can verify Codex Plus extraction ran.
 
 ## PDF Generation from Text (Invoice / Receipt)
 
@@ -220,6 +220,7 @@ Responses to users must be written for accountants, not developers. After Tally 
 
 ## Critical rules (must follow)
 
+0. **Extractor env + file attachments**: If the user attached a PDF or image and `$EXTRACTOR_URL` or `$EXTRACTOR_BEARER` is unset, **stop immediately** and tell the user to set both in the OpenClaw process environment (PM2 `ecosystem.config.cjs`). Do not read the file with local vision/OCR or the onboard LLM. After a successful `/v1/extract`, you **must** cite `request_id` from the JSON in your reply before posting to Tally.
 1. **Never assume company**: if not explicit, ask which company to use before posting.
 2. **Never guess ledgers**: verify ledgers exist before voucher import; create missing masters first.
 3. **Dates are `YYYYMMDD`** (no separators).
@@ -231,7 +232,7 @@ Responses to users must be written for accountants, not developers. After Tally 
 9. **Accounting-only vouchers (no inventory items)**: set `<ISINVOICE>No</ISINVOICE>` and place the **party ledger entry first** in the `ALLLEDGERENTRIES.LIST` sequence. This makes the Day Book "Particulars" column show the party name (not the expense/purchase ledger) and defaults the voucher to the clean "As Voucher" view. Only use `ISINVOICE=Yes` for item invoices that go through `reference/inventory.md`.
 10. **Accounting Invoice Mode — always use `LEDGERENTRIES.LIST`**: when `OBJVIEW="Invoice Voucher View"` is set (Modes 1 and 2 in `reference/vouchers.md`), every ledger block **must** use `<LEDGERENTRIES.LIST>`, not `<ALLLEDGERENTRIES.LIST>`. Tally silently ignores `ALLLEDGERENTRIES` in this view, causing the voucher to be saved with no entries and the error "No accounting or inventory entries are available."
 11. **Voucher class decision — confirm before posting**: before posting any Purchase or Sales voucher, check whether the company's voucher type uses a class for GST splitting. Run the preflight checklist in the "Preflight checklist before posting" section below. If class mode is confirmed, set `<CLASSNAME>EXACT_CLASS_NAME</CLASSNAME>` in the voucher header and include all four GST header fields (`CMPGSTIN`, `PARTYGSTIN`, `GSTREGISTRATIONTYPE`, `PLACEOFSUPPLY`). **If class existence is unconfirmed, stop and ask — do not post without it.** Full decision rules and templates are in the "Voucher class — decision rules" section of `reference/vouchers.md`.
-12. **Use the hosted extractor for PDF/images**: for any bill/invoice file from WhatsApp or Telegram, call `$EXTRACTOR_URL/v1/extract` first. Do not use local vision/OCR. If extraction fails or confidence is low, ask the user to confirm fields before posting.
+12. **Use the hosted extractor for PDF/images**: for any bill/invoice file from WhatsApp or Telegram, call `$EXTRACTOR_URL/v1/extract` first with the **original attachment filename** (e.g. `Invoice No.8933180859.PDF`). Do not use local vision/OCR or the onboard model to read the file. If extraction fails or confidence is low, ask the user to confirm fields before posting. If you posted a voucher without a `request_id` from the extractor, you violated this skill.
 
 ## Preflight checklist before posting
 
@@ -265,6 +266,16 @@ If not running, stop and ask user to open TallyPrime and enable integrations for
 ## Step 1a: Extract document via hosted extractor (PDF / image only)
 
 When the user attaches a PDF or image (invoice, bill, credit note scan), **before** company or ledger steps:
+
+**Mandatory:** Run Step 1a.1 and 1a.2. Save the JSON `request_id` field — you must echo it in the final user confirmation (e.g. `Extractor request_id: abc-123`). If you skip this step, stop and do not post to Tally.
+
+### 1a.0 Env preflight (file attached only)
+
+```bash
+test -n "$EXTRACTOR_URL" && test -n "$EXTRACTOR_BEARER" && echo ok || echo MISSING_EXTRACTOR_ENV
+```
+
+If output is `MISSING_EXTRACTOR_ENV`, stop and ask the user to fix PM2 env (`EXTRACTOR_URL`, `EXTRACTOR_BEARER`). Do not proceed with local PDF reading.
 
 ### 1a.1 Check extractor health
 
@@ -303,9 +314,12 @@ curl -s -X POST "$EXTRACTOR_URL/v1/extract" \
 ### 1a.3 Use extracted data
 
 - Map `extracted` fields into voucher posting (party, date, amounts, GST, items).
+- Store `request_id` from the extract response for the final summary line: `Extractor request_id: <request_id>`.
 - If `extracted.confidence.overall` &lt; 0.7 or key fields are null, **ask the user** to confirm before posting.
 - If `status` is `error`, relay `message` in plain language; do not guess missing fields.
 - For **text-only** messages (no file), skip this step and parse the text directly.
+
+**Before posting (verification):** Confirm you have a non-empty `request_id` from Step 1a.2. If missing, go back and run the extract curl — do not invent invoice fields from the attachment.
 
 Then continue to **Step 1** (company context).
 

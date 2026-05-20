@@ -554,7 +554,7 @@ Terminal 2 — run extract (300s max wait; shows errors if any):
 cd /opt/tally/tally-aws-all-config/extractor-service
 export EXTRACTOR_BEARER=$(grep '^EXTRACTOR_BEARER=' .env | cut -d= -f2-)
 
-curl --max-time 300 -X POST http://127.0.0.1:8080/v1/extract \
+curl --max-time 120 -X POST http://127.0.0.1:8080/v1/extract \
   -H "Authorization: Bearer $EXTRACTOR_BEARER" \
   -F "file=@/home/ubuntu/samples/invoice-page-1.png" | jq .
 ```
@@ -622,23 +622,90 @@ Then `pm2 restart extractor`.
 
 ---
 
-### Step F7 — Expose extractor to the internet (for client OpenClaw)
+### Step F7 — Let the client PC reach the extractor (pick one path)
 
-Your client machine must reach EC2 on HTTPS. Options:
+> **Running OpenClaw on the same EC2 as extractor?** Skip F7 and Part G on Windows. Use **[Part I — Dev mode: all on EC2](#part-i--dev-mode-openclaw--extractor-on-ec2-tally-on-laptop-ngrok)** instead (`EXTRACTOR_URL=http://127.0.0.1:8080`).
 
-**Option A — Quick dev test: SSH tunnel (no public URL)**
+**Before F7 — you must have:**
 
-On your **Windows PC**:
+- [ ] F5 health on EC2: `codex_logged_in: true`
+- [ ] F6 extract on EC2: `status: ok` with real fields (`invoice_no`, `total`, …)
+- [ ] `EXTRACTOR_BEARER` copied from EC2 `extractor-service/.env`
+
+**What you are doing:** OpenClaw on the **client PC** (Part G) must call the extractor API. F7 connects that PC to EC2. Pick **one** row below and use the matching `EXTRACTOR_URL` in Step G5.
+
+| Path | When to use | `EXTRACTOR_URL` on client (G5) |
+|------|-------------|----------------------------------|
+| **A — SSH tunnel** | Dev; no public URL; tunnel on same PC as OpenClaw | `http://127.0.0.1:18080` |
+| **C — Direct EC2 IP** | Security group has port **8080 / My IP** (Part B2) | `http://YOUR_EC2_PUBLIC_IP:8080` |
+| **B — Cloudflare Tunnel** | Production; stable HTTPS | `https://extractor.yourdomain.com` |
+
+---
+
+#### Option A — SSH tunnel (Windows PC → EC2)
+
+**Where:** Windows PowerShell (not inside the SSH session).
+
+**A1 — Open the tunnel** (leave this window open):
 
 ```powershell
-ssh -i "C:\Users\meetp\Downloads\tally-dev-key.pem" -L 8080:127.0.0.1:8080 ubuntu@3.110.xx.xx
+ssh -4 -i "C:\Users\meetp\Downloads\tally-dev-key.pem" -L 127.0.0.1:18080:127.0.0.1:8080 ubuntu@YOUR_EC2_PUBLIC_IP
 ```
 
-Then on client set `EXTRACTOR_URL=http://127.0.0.1:8080` (only works while tunnel is open).
+- `-4` = IPv4 only (helps on Windows)
+- **18080** on your PC forwards to **8080** on EC2 (extractor)
+- Replace `YOUR_EC2_PUBLIC_IP` with your instance public IPv4
 
-**Option B — Production: Cloudflare Tunnel (stable URL)**
+**If you see** `bind [127.0.0.1]:8080: Permission denied` — port 8080 is already in use on Windows. Use **18080** as above (do not use local port 8080).
 
-On EC2:
+**A2 — Check what is using port 8080** (optional, in a second PowerShell window):
+
+```powershell
+netstat -ano | findstr :8080
+```
+
+Stop the program using that PID, or keep using local port **18080** in the SSH command.
+
+**A3 — Verify tunnel from Windows** (second PowerShell window; tunnel window still open):
+
+```powershell
+$TOKEN = "paste-EXTRACTOR_BEARER-from-EC2-.env"
+curl.exe -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/v1/health
+```
+
+Expected: `"status":"ok"` and `"codex_logged_in":true`.
+
+**For Part G5 use:** `EXTRACTOR_URL: 'http://127.0.0.1:18080'` (tunnel must stay open whenever OpenClaw extracts invoices).
+
+---
+
+#### Option C — Direct EC2 IP (no tunnel)
+
+**Where:** EC2 first, then Windows.
+
+**C1 — On EC2 (SSH):**
+
+```bash
+export EXTRACTOR_BEARER=$(grep '^EXTRACTOR_BEARER=' /opt/tally/tally-aws-all-config/extractor-service/.env | cut -d= -f2-)
+curl -s -H "Authorization: Bearer $EXTRACTOR_BEARER" http://127.0.0.1:8080/v1/health | jq .
+```
+
+**C2 — On Windows PC** (replace IP; no SSH tunnel):
+
+```powershell
+$TOKEN = "paste-EXTRACTOR_BEARER-from-EC2-.env"
+curl.exe -H "Authorization: Bearer $TOKEN" http://YOUR_EC2_PUBLIC_IP:8080/v1/health
+```
+
+If C2 fails: AWS Console → EC2 → Security group → Inbound rule **Custom TCP 8080** source **My IP**.
+
+**For Part G5 use:** `EXTRACTOR_URL: 'http://YOUR_EC2_PUBLIC_IP:8080'`
+
+---
+
+#### Option B — Cloudflare Tunnel (production)
+
+**Where:** EC2 (SSH).
 
 ```bash
 # install cloudflared — see https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/
@@ -651,24 +718,28 @@ cloudflared tunnel route dns tally-extractor extractor.yourdomain.com
 cloudflared tunnel run --url http://127.0.0.1:8080 tally-extractor
 ```
 
-Use `https://extractor.yourdomain.com` as `EXTRACTOR_URL` on the client.
-
-**Option C — Dev only: open port 8080 in security group**
-
-If you added port 8080 for My IP in B2:
-
-```bash
-curl -s -H "Authorization: Bearer $EXTRACTOR_BEARER" \
-  http://3.110.xx.xx:8080/v1/health | jq .
-```
+**For Part G5 use:** `EXTRACTOR_URL: 'https://extractor.yourdomain.com'` (no trailing slash).
 
 ---
 
-## Part G — Client CPU (Tally + OpenClaw)
+## Part G — Client PC (TallyPrime + OpenClaw)
 
-This runs on the **machine beside TallyPrime** (your laptop or client office PC).
+### What is the “client” machine?
+
+| Term | Machine | What runs there |
+|------|---------|-----------------|
+| **EC2** | AWS server | `extractor-service`, Codex CLI |
+| **Client** | PC beside Tally — usually **your Windows laptop** | TallyPrime (`:9000`), OpenClaw, Telegram bot, `tally-skill` |
+
+**“Set `EXTRACTOR_URL` on the client”** means: put it in `C:\tally\ecosystem.config.cjs` (Step G5) so OpenClaw can call the extractor when a user sends a PDF. You do **not** set this on EC2 (unless using Part I all-on-EC2 shortcut).
+
+If Tally + OpenClaw are on the **same laptop** where you run the SSH tunnel (Option A), that laptop **is** the client.
+
+---
 
 ### Step G1 — Install TallyPrime
+
+**Where:** Client PC (Windows).
 
 1. Install and open TallyPrime
 2. Press **F1** → **Settings** → **Connectivity**
@@ -680,7 +751,9 @@ This runs on the **machine beside TallyPrime** (your laptop or client office PC)
 
 ### Step G2 — Install Node, OpenClaw, tallyca
 
-On Windows (PowerShell as admin if needed):
+**Where:** Client PC.
+
+**Windows (PowerShell; admin if npm global install fails):**
 
 ```powershell
 # Install Node 20 LTS from https://nodejs.org if not installed
@@ -689,25 +762,27 @@ openclaw --version
 tallyca --version
 ```
 
-On Linux client, same as EC2 Node install + `npm i -g openclaw tallyca pm2`.
+**Linux client:** same as EC2 Node install + `npm i -g openclaw tallyca pm2`.
 
 ---
 
 ### Step G3 — Get tally-skill onto client
 
-Either clone the same repo:
+**Where:** Client PC.
 
 ```powershell
 git clone https://github.com/meetpaladiya44/tally-aws-all-config.git C:\tally\tally-aws-all-config
 ```
 
-Or copy only `tally-skill` folder via USB/SCP.
+Or copy only the `tally-skill` folder via USB/SCP.
 
 ---
 
 ### Step G4 — OpenClaw onboard
 
-```bash
+**Where:** Client PC.
+
+```powershell
 openclaw onboard
 ```
 
@@ -720,7 +795,7 @@ openclaw onboard
 
 Register skill:
 
-```bash
+```powershell
 cd C:\tally\tally-aws-all-config
 openclaw skill add ./tally-skill --as tally-prime-ca
 ```
@@ -729,7 +804,52 @@ openclaw skill add ./tally-skill --as tally-prime-ca
 
 ### Step G5 — Set environment variables on client
 
-Create `C:\tally\ecosystem.config.cjs` (or `~/ecosystem.config.cjs` on Linux):
+**Where:** Client PC.
+
+Create folder and config file:
+
+```powershell
+mkdir C:\tally -Force
+notepad C:\tally\ecosystem.config.cjs
+```
+
+Paste **one** of the blocks below. Change `EXTRACTOR_BEARER` to the **exact** value from EC2 `extractor-service/.env`.
+
+**Option A — SSH tunnel (F7 Option A; tunnel must be running on this PC):**
+
+```javascript
+module.exports = {
+  apps: [{
+    name: 'openclaw-tally',
+    script: 'openclaw',
+    args: 'serve --skill tally-prime-ca',
+    env: {
+      TALLY_URL: 'http://localhost:9000',
+      EXTRACTOR_URL: 'http://127.0.0.1:18080',
+      EXTRACTOR_BEARER: 'PASTE_SAME_TOKEN_AS_EC2_ENV',
+    },
+  }],
+};
+```
+
+**Option C — Direct EC2 IP (F7 Option C; no tunnel):**
+
+```javascript
+module.exports = {
+  apps: [{
+    name: 'openclaw-tally',
+    script: 'openclaw',
+    args: 'serve --skill tally-prime-ca',
+    env: {
+      TALLY_URL: 'http://localhost:9000',
+      EXTRACTOR_URL: 'http://YOUR_EC2_PUBLIC_IP:8080',
+      EXTRACTOR_BEARER: 'PASTE_SAME_TOKEN_AS_EC2_ENV',
+    },
+  }],
+};
+```
+
+**Option B — Cloudflare (F7 Option B):**
 
 ```javascript
 module.exports = {
@@ -740,15 +860,18 @@ module.exports = {
     env: {
       TALLY_URL: 'http://localhost:9000',
       EXTRACTOR_URL: 'https://extractor.yourdomain.com',
-      EXTRACTOR_BEARER: 'SAME_TOKEN_AS_EC2_ENV',
+      EXTRACTOR_BEARER: 'PASTE_SAME_TOKEN_AS_EC2_ENV',
     },
   }],
 };
 ```
 
-Start:
+**G6 — Start OpenClaw with PM2**
 
-```bash
+**Where:** Client PC.
+
+```powershell
+cd C:\tally
 pm2 start ecosystem.config.cjs
 pm2 save
 pm2 logs openclaw-tally
@@ -759,42 +882,341 @@ pm2 logs openclaw-tally
 - `EXTRACTOR_BEARER` must match EC2 `extractor-service/.env` exactly
 - `EXTRACTOR_URL` — no trailing slash
 - Do **not** expose Tally port 9000 to the internet
+- Option A: keep the SSH tunnel PowerShell window open while testing
 
 ---
 
 ## Part H — End-to-end test
 
-| # | Check | Command / action |
-|---|--------|------------------|
-| H1 | EC2 Codex logged in | `curl .../v1/health` → `codex_logged_in: true` |
-| H2 | EC2 extract works | `curl -F file=@~/Invoice No.8933183031.PDF .../v1/extract` → `status: ok` |
-| H3 | Client Tally up | `curl http://localhost:9000` on client |
-| H4 | OpenClaw running | `pm2 status` → openclaw-tally online |
-| H5 | Telegram bot | Send `/start` to your bot |
-| H6 | Full flow | Send invoice PDF to bot → check Tally for new voucher |
+Run in order. Fix any step before the next.
+
+| # | Where | Check | Command / action |
+|---|-------|--------|------------------|
+| H1 | EC2 | Codex logged in | `curl -s -H "Authorization: Bearer $EXTRACTOR_BEARER" http://127.0.0.1:8080/v1/health \| jq .` → `codex_logged_in: true` |
+| H2 | EC2 | Extract works | F6 PNG/PDF curl → `status: ok` with `invoice_no`, `total` |
+| H3 | Client | Tally up | PowerShell: `curl.exe http://localhost:9000` → Tally message |
+| H4 | Client | F7 path works | Option A: `curl.exe ... http://127.0.0.1:18080/v1/health` **or** Option C: `curl.exe ... http://EC2_IP:8080/v1/health` |
+| H5 | Client | OpenClaw running | `pm2 status` → `openclaw-tally` **online** |
+| H6 | Client | Telegram bot | Send `/start` to your bot |
+| H7 | Client | Full flow | Send invoice PDF/image to bot → confirm voucher in TallyPrime |
 
 **Logs:**
 
 ```bash
-# EC2
+# EC2 (SSH)
 pm2 logs extractor --lines 100
+```
 
-# Client
+```powershell
+# Client PC
 pm2 logs openclaw-tally --lines 100
 ```
 
 ---
 
-## Part I — Dev shortcut: everything on EC2 first
+## Part I — Dev mode: OpenClaw + extractor on EC2, Tally on laptop (ngrok)
 
-If you want to test **before** setting up a separate client machine:
+Use this path when **both** `extractor-service` and **OpenClaw** run on your **AWS EC2**, and **TallyPrime** runs on your **Windows laptop**. This is common for dev before moving OpenClaw beside Tally in production.
 
-1. EC2: extractor running (Parts C–F)
-2. On your laptop: `ngrok http 9000` for Tally (dev only)
-3. On EC2: install OpenClaw too, set `TALLY_URL` to ngrok URL, same `EXTRACTOR_URL=http://127.0.0.1:8080`
-4. Send PDF to Telegram bot running on EC2
+### How the pieces connect (no magic pipe)
 
-Production should still be: **extractor on EC2**, **OpenClaw + Tally on client**.
+The extractor **does not push** data to OpenClaw. Two separate PM2 processes talk over **HTTP on localhost**:
+
+| Process | PM2 name | Role | AI / auth |
+|---------|----------|------|-----------|
+| `extractor-service` | `extractor` | `POST /v1/extract` → JSON | **Codex CLI** + **ChatGPT Plus** (`codex login` on EC2) |
+| OpenClaw + `tally-skill` | `openclaw-tally` | Telegram bot; runs `curl` per SKILL.md | **OpenAI API key** from `openclaw onboard` (agent reasoning) |
+
+When you send a PDF on Telegram:
+
+1. OpenClaw saves the attachment on EC2.
+2. The agent runs **Step 1a** in `tally-skill/SKILL.md` — a `curl` to `http://127.0.0.1:8080/v1/extract` with `EXTRACTOR_BEARER`.
+3. Extractor runs Codex on the image/PDF and returns `extracted` JSON.
+4. The agent uses that JSON and posts a voucher to `TALLY_URL` (your laptop via ngrok).
+
+```text
+Telegram → OpenClaw (EC2) ──curl──► extractor :8080 (EC2) ──codex──► ChatGPT Plus
+                │
+                └──curl XML──► TALLY_URL (ngrok) ──► TallyPrime :9000 (Windows laptop)
+```
+
+**Skip Part F7** (SSH tunnel / public extractor URL) — OpenClaw and extractor share the same machine; use `EXTRACTOR_URL=http://127.0.0.1:8080`.
+
+**Two different OpenAI-related setups (both correct):**
+
+- `openclaw onboard` → OpenAI **API key** for the agent (chat, tools, following the skill).
+- EC2 `codex login` → **ChatGPT Plus** for extraction only. The onboard API key is **not** used by the extractor.
+
+---
+
+### Part I prerequisites
+
+- [ ] Parts C–F done on EC2 (`extractor` PM2 online, F6 extract returns real fields)
+- [ ] TallyPrime on laptop: server on port **9000**, browser `http://localhost:9000` works
+- [ ] Telegram bot token from BotFather
+- [ ] OpenAI API key for OpenClaw agent (separate from Plus/Codex on extractor)
+
+---
+
+### I1 — Keep extractor running (EC2)
+
+**Where:** EC2 SSH.
+
+```bash
+pm2 status
+pm2 logs extractor --lines 20
+```
+
+---
+
+### I2 — Install OpenClaw and tally-skill on EC2
+
+**Where:** EC2 SSH.
+
+```bash
+# If not already installed (same as Part C Node + global packages)
+npm install -g openclaw tallyca pm2
+
+openclaw onboard
+```
+
+| Prompt | Answer |
+|--------|--------|
+| LLM | **OpenAI API key** (for agent — not used for PDF extraction) |
+| Channel | **Telegram** — BotFather token |
+| Skill / workdir | your choice |
+
+Register the skill:
+
+```bash
+cd /opt/tally/tally-aws-all-config
+openclaw skill add ./tally-skill --as tally-prime-ca
+```
+
+---
+
+### I3 — PM2 config on EC2 (localhost extractor + ngrok Tally)
+
+**Where:** EC2 SSH.
+
+```bash
+mkdir -p ~/tally-openclaw
+nano ~/tally-openclaw/ecosystem.config.cjs
+```
+
+Paste (replace placeholders):
+
+```javascript
+module.exports = {
+  apps: [{
+    name: 'openclaw-tally',
+    script: 'openclaw',
+    args: 'serve --skill tally-prime-ca',
+    env: {
+      TALLY_URL: 'https://YOUR-NGROK-SUBDOMAIN.ngrok-free.app',
+      EXTRACTOR_URL: 'http://127.0.0.1:8080',
+      EXTRACTOR_BEARER: 'PASTE_SAME_TOKEN_AS_extractor-service_.env',
+    },
+  }],
+};
+```
+
+Start:
+
+```bash
+cd ~/tally-openclaw
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 logs openclaw-tally
+```
+
+You should now have **two** PM2 apps: `extractor` and `openclaw-tally`.
+
+---
+
+### I4 — Expose Tally from Windows laptop (ngrok)
+
+**Where:** Windows laptop (Tally must be open with XML/HTTP on port 9000).
+
+```powershell
+# Install ngrok from https://ngrok.com/download then:
+ngrok http 9000
+```
+
+Copy the **https** forwarding URL (e.g. `https://abc123.ngrok-free.app`). Put it in EC2 `ecosystem.config.cjs` as `TALLY_URL` (no trailing slash).
+
+**Where:** EC2 SSH — restart OpenClaw after updating `TALLY_URL`:
+
+```bash
+pm2 restart openclaw-tally
+```
+
+Verify Tally reachable from EC2:
+
+```bash
+export TALLY_URL='https://YOUR-NGROK-SUBDOMAIN.ngrok-free.app'
+curl -s --max-time 15 "$TALLY_URL"
+```
+
+Expected: XML containing `TallyPrime Server is Running` (or similar).
+
+---
+
+### I5 — Manual test: same curls the agent runs (SKILL Step 1a)
+
+**Where:** EC2 SSH. Simulates `tally-skill/SKILL.md` Step 1a before using Telegram.
+
+```bash
+export EXTRACTOR_URL=http://127.0.0.1:8080
+export EXTRACTOR_BEARER=$(grep '^EXTRACTOR_BEARER=' /opt/tally/tally-aws-all-config/extractor-service/.env | cut -d= -f2-)
+
+# 1a.1 health
+curl -s -H "Authorization: Bearer $EXTRACTOR_BEARER" "$EXTRACTOR_URL/v1/health" | jq .
+
+# 1a.2 extract (use your sample PNG)
+curl -s --max-time 300 -X POST "$EXTRACTOR_URL/v1/extract" \
+  -H "Authorization: Bearer $EXTRACTOR_BEARER" \
+  -F "file=@/home/ubuntu/samples/invoice-page-1.png" \
+  -F "prompt=Extract GST invoice fields for Tally voucher posting" | jq .
+```
+
+Success: `"status":"ok"` and `extracted` with `invoice_no`, `total`, etc. If this works, the agent can call the same URLs from `EXTRACTOR_URL` / `EXTRACTOR_BEARER` in PM2 env.
+
+---
+
+### I5b — Verify the Telegram bot uses your skill + extractor
+
+**Why:** If `pm2 logs openclaw-tally` is empty during a Telegram chat but the bot still replies, a **different** OpenClaw process (from `openclaw onboard`, without `EXTRACTOR_URL`) may be answering. That process uses the **OpenAI API** to read PDFs directly — **not** Codex Plus via the extractor.
+
+**Where:** EC2 SSH.
+
+```bash
+# All OpenClaw processes (expect ONE if only PM2 should run Telegram)
+ps -ef | grep -i openclaw | grep -v grep
+
+# PM2 app env (must show EXTRACTOR_URL and EXTRACTOR_BEARER)
+pm2 list
+pm2 describe openclaw-tally
+# Note the pm2 id, then:
+pm2 env <id>
+
+# Skills loaded
+openclaw skill list
+```
+
+**Use only one tally skill for testing.** If both `tally-prime-ca` (local repo) and a ClawHub `tally-skill` appear, remove the ClawHub copy:
+
+```bash
+openclaw skill remove tally-skill
+openclaw skill list
+```
+
+Re-register local skill if needed:
+
+```bash
+cd /opt/tally/tally-aws-all-config
+openclaw skill add ./tally-skill --as tally-prime-ca
+```
+
+**Smoke run — prove extractor receives Telegram uploads:**
+
+Terminal 1:
+
+```bash
+pm2 logs extractor --lines 0 | grep --line-buffered '\[extract\]'
+```
+
+Terminal 2: send a **new** invoice PDF on Telegram (not a text-only message).
+
+**Expected in Terminal 1 within ~1–5 min** (filename must match your PDF, **not** `invoice-page-1.png`):
+
+```text
+[extract] start request_id=... file=Invoice_No.8933180859.PDF mime=application/pdf size=... ip=127.0.0.1 ...
+[extract] pdf-converted request_id=... pages=1 images=page-1.png
+[codex] starting: ...
+[codex] finished, NNN chars from Codex
+[extract] done request_id=... pages=1 model=gpt-5.5 raw_chars=... invoice_hint=...
+```
+
+**Telegram reply must include:** `Extractor request_id: <same uuid>` (required by `tally-skill`).
+
+If you see **no** `[extract] start` with your PDF filename, the bot did **not** call the extractor — fix I5c below.
+
+---
+
+### I5c — Stop rogue OpenClaw daemons (only PM2 should answer Telegram)
+
+`openclaw onboard` may have started a background gateway that still owns your Telegram bot. That process usually **lacks** `EXTRACTOR_URL` / `EXTRACTOR_BEARER`.
+
+**Where:** EC2 SSH.
+
+```bash
+ps -ef | grep -i openclaw | grep -v grep
+```
+
+For each PID **not** listed under `pm2 list` as `openclaw-tally`, stop it:
+
+```bash
+kill <PID>
+# or if it respawns:
+pkill -f 'openclaw.*gateway'
+```
+
+Then ensure only PM2 runs the bot:
+
+```bash
+pm2 restart openclaw-tally
+pm2 logs openclaw-tally --lines 0
+```
+
+Send `/start` on Telegram again and repeat I5b smoke run.
+
+---
+
+### I6 — End-to-end checklist (Part I dev)
+
+| # | Where | Check |
+|---|-------|--------|
+| I6.1 | EC2 | `pm2 status` → `extractor` and `openclaw-tally` **online** |
+| I6.2 | EC2 | I5 health + extract curls succeed |
+| I6.3 | Laptop | `http://localhost:9000` — Tally up |
+| I6.4 | EC2 | `curl $TALLY_URL` via ngrok succeeds |
+| I6.5 | Telegram | Send `/start` to your bot |
+| I6.6 | EC2 | I5b smoke run: `[extract] start file=YourInvoice.PDF` (not only `invoice-page-1.png`) |
+| I6.7 | Telegram | Reply includes `Extractor request_id: ...` matching extractor logs |
+| I6.8 | Telegram | Voucher in Tally; confirm amounts match extractor JSON |
+
+**Logs during I6.6–I6.8:**
+
+```bash
+# EC2 — grep-friendly extractor trace
+pm2 logs extractor --lines 0 | grep --line-buffered '\[extract\]'
+
+# EC2 — OpenClaw agent steps
+pm2 logs openclaw-tally --lines 0
+```
+
+---
+
+### Part I vs production layout
+
+| | Dev (Part I) | Production (Part G + F7) |
+|--|----------------|---------------------------|
+| Extractor | EC2 | EC2 |
+| OpenClaw | EC2 | Client PC beside Tally |
+| Tally | Laptop + ngrok | `localhost:9000` on client |
+| `EXTRACTOR_URL` | `http://127.0.0.1:8080` | Tunnel, public IP, or Cloudflare (F7) |
+| `TALLY_URL` | ngrok HTTPS URL | `http://localhost:9000` |
+
+---
+
+### What to skip when using Part I
+
+| Section | Skip? |
+|---------|--------|
+| **F7** | Yes — extractor is localhost on EC2 |
+| **Part G on Windows** | Yes — do I2–I3 on EC2 instead |
+| **F7 SSH tunnel from laptop** | Yes |
 
 ---
 
@@ -803,6 +1225,9 @@ Production should still be: **extractor on EC2**, **OpenClaw + Tally on client**
 | Action | Where | Command |
 |--------|-------|---------|
 | SSH to EC2 | PC | `ssh -i key.pem ubuntu@<ip>` |
+| SSH tunnel (F7 A) | PC | `ssh -4 -i key.pem -L 127.0.0.1:18080:127.0.0.1:8080 ubuntu@<ip>` |
+| Health via tunnel | PC | `curl.exe -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/v1/health` |
+| Health via public IP | PC | `curl.exe -H "Authorization: Bearer $TOKEN" http://<ec2-ip>:8080/v1/health` |
 | Copy PDF to EC2 | PC | `scp -i key.pem "Invoice No.8933183031.PDF" ubuntu@<ip>:~/` |
 | Codex image test | EC2 | `codex exec --skip-git-repo-check --image ~/samples/invoice-page-1.png -- "prompt"` |
 | PDF → PNG | EC2 | `pdftoppm -png ~/'Invoice No.8933183031.PDF' ~/samples/invoice-page` |
@@ -812,6 +1237,11 @@ Production should still be: **extractor on EC2**, **OpenClaw + Tally on client**
 | Restart extractor | EC2 | `pm2 restart extractor` |
 | Re-login Codex | EC2 | `codex login --device-code` |
 | Tally check | Client | `curl -s http://localhost:9000` |
+| Part I: OpenClaw on EC2 | EC2 | `EXTRACTOR_URL=http://127.0.0.1:8080` in ecosystem.config.cjs |
+| Part I: ngrok Tally | Laptop | `ngrok http 9000` → set `TALLY_URL` on EC2 |
+| Part I: both PM2 apps | EC2 | `pm2 status` → `extractor` + `openclaw-tally` |
+| SKILL 1a test (Part I) | EC2 | `curl POST $EXTRACTOR_URL/v1/extract -F file=@...` |
+| Grep extractor requests | EC2 | `pm2 logs extractor \| grep '\[extract\]'` |
 
 ---
 
@@ -829,8 +1259,15 @@ Production should still be: **extractor on EC2**, **OpenClaw + Tally on client**
 | curl hangs, no output | Normal for 1–5 min; use `pm2 logs extractor`; use `--max-time 300`; don't use Ctrl+C early |
 | Codex stuck in PM2 | Add to `.env`: `CODEX_EXTRA_ARGS=--dangerously-bypass-approvals-and-sandbox`, then `pm2 restart extractor` |
 | `401 Unauthorized` | `EXTRACTOR_BEARER` mismatch between client and EC2 `.env` |
+| `bind [127.0.0.1]:8080: Permission denied` (SSH `-L`) | Port 8080 in use on Windows — use `-L 127.0.0.1:18080:127.0.0.1:8080` and `EXTRACTOR_URL=http://127.0.0.1:18080`; or use F7 Option C |
 | SCP permission denied | `chmod 600 key.pem` / `icacls` on Windows |
 | Git clone asks password | Use GitHub PAT as password, or SSH key |
+| OpenClaw on EC2: how does extractor connect? | HTTP only — agent runs `curl` to `127.0.0.1:8080`; see Part I |
+| `curl $TALLY_URL` fails from EC2 | ngrok not running, wrong URL, or Tally server off on laptop |
+| Agent extracts but Tally fails | Fix ngrok + `TALLY_URL`; test `curl $TALLY_URL` from EC2 |
+| Telegram works but extractor logs only `invoice-page-1.png` | Those are manual F6 curls — bot never called extractor; run I5b/I5c |
+| Voucher posted, no `Extractor request_id` in Telegram reply | Rogue OpenClaw or skill skipped Step 1a — kill extra processes; use local `tally-prime-ca` |
+| `pm2 logs openclaw-tally` empty during chat | Wrong process owns Telegram — I5c |
 
 ---
 
